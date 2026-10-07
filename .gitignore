@@ -1,0 +1,7 @@
+scripts/bulk-delete-output/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.venv/
+venv/

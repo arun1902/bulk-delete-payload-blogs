@@ -202,6 +202,7 @@ class FakeHttp:
     def __init__(self):
         self.calls: list[tuple[str, str]] = []
         self.delete_ids: list[str] = []
+        self.published: list[str] = []
         self.tenants = {
             "example.nl": {"id": "t1", "slug": "example", "domain": "example.nl"},
         }
@@ -374,6 +375,11 @@ class FakeHttp:
             doc_id = path.rsplit("/", 1)[-1]
             self.delete_ids.append(doc_id)
             return FakeResponse(None)
+
+        if method == "POST" and path.startswith("/api/tenants/") and path.endswith("/publish"):
+            tenant_id = path.split("/")[-2]
+            self.published.append(tenant_id)
+            return FakeResponse({"ok": True, "message": "dispatched", "runUrl": f"https://ci.test/{tenant_id}"})
 
         raise AssertionError(f"Unhandled request {method} {full}")
 
@@ -609,6 +615,8 @@ def test_real_delete_after_confirm(tmp_path: Path, monkeypatch):
 
     assert counters.deleted == 1
     assert http.delete_ids == ["p1"]
+    assert http.published == ["t1"]
+    assert counters.deployed == 1
 
 
 def test_resume_skips_already_deleted(tmp_path: Path):

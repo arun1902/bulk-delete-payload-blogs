@@ -28,6 +28,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import unicodedata
 import uuid
@@ -35,6 +36,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -81,6 +83,7 @@ class SheetRow:
     matched_id: Optional[str] = None
     matched_slug: Optional[str] = None
     matched_tenant: Optional[str] = None
+    matched_tenant_id: Optional[str] = None
 
 
 @dataclass
@@ -89,6 +92,7 @@ class MatchResult:
     payload_id: Optional[str] = None
     slug: Optional[str] = None
     tenant: Optional[str] = None
+    tenant_id: Optional[str] = None
     error: Optional[str] = None
     candidates: list[str] = field(default_factory=list)
 
@@ -110,12 +114,14 @@ class RunConfig:
     dry_run: bool = True
     limit: Optional[int] = None
     batch_size: int = 25
+    workers: int = 1
     request_delay_ms: int = 100
     max_retries: int = 5
     backoff_base_s: float = 1.0
     backoff_max_s: float = 60.0
     output_dir: Path = DEFAULT_OUTPUT_DIR
     yes: bool = False
+    auto_deploy: bool = True
     progress_file: Optional[Path] = None
     results_file: Optional[Path] = None
     failed_file: Optional[Path] = None
@@ -139,6 +145,8 @@ class Counters:
     failed: int = 0
     skipped: int = 0
     remaining: int = 0
+    deployed: int = 0
+    deploy_failed: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -400,6 +408,7 @@ class PayloadRestClient:
         self.sleep_fn = sleep_fn
         self._opener = opener or urllib.request.urlopen
         self._last_request_at = 0.0
+        self._slot_lock = threading.Lock()
         self.cookie_prefix = cookie_prefix
         self.totp_cookie: Optional[str] = None
         self.session_refresh_s = session_refresh_s
@@ -570,10 +579,14 @@ class PayloadRestClient:
     def _throttle(self) -> None:
         if self.request_delay_ms <= 0:
             return
-        elapsed = time.monotonic() - self._last_request_at
-        need = self.request_delay_ms / 1000.0
-        if elapsed < need:
-            self.sleep_fn(need - elapsed)
+        gap = self.request_delay_ms / 1000.0
+        with self._slot_lock:
+            now = time.monotonic()
+            start = max(now, self._last_request_at + gap)
+            wait = start - now
+            self._last_request_at = start
+        if wait > 0:
+            self.sleep_fn(wait)
 
     def request(
         self,
@@ -748,6 +761,15 @@ class PayloadRestClient:
 
     def delete_blog(self, collection: str, doc_id: str) -> None:
         self.request("DELETE", f"/api/{collection}/{urllib.parse.quote(str(doc_id), safe='')}")
+
+    def publish_tenant(self, tenant_id: str) -> dict[str, Any]:
+        """POST /api/tenants/:id/publish — same action as admin “Publish content”."""
+        data = self.request(
+            "POST",
+            f"/api/tenants/{urllib.parse.quote(str(tenant_id), safe='')}/publish",
+            json_body={},
+        )
+        return dict(data or {})
 
     def ensure_api_key(self, user: Mapping[str, Any]) -> Optional[str]:
         """Return the account's API key, enabling one only if none exists.
@@ -1032,18 +1054,25 @@ class Matcher:
         self.collection = collection
         self._tenant_by_domain: dict[str, Optional[dict[str, Any]]] = {}
         self._tenant_by_slug: dict[str, Optional[dict[str, Any]]] = {}
+        self._cache_lock = threading.Lock()
 
     def resolve_tenant_domain(self, domain: str) -> Optional[dict[str, Any]]:
         key = normalize_domain(domain)
-        if key not in self._tenant_by_domain:
-            self._tenant_by_domain[key] = self.client.find_tenant_by_domain(key)
-        return self._tenant_by_domain[key]
+        with self._cache_lock:
+            if key in self._tenant_by_domain:
+                return self._tenant_by_domain[key]
+        tenant = self.client.find_tenant_by_domain(key)
+        with self._cache_lock:
+            return self._tenant_by_domain.setdefault(key, tenant)
 
     def resolve_tenant_slug(self, slug: str) -> Optional[dict[str, Any]]:
         key = slug.strip().lower()
-        if key not in self._tenant_by_slug:
-            self._tenant_by_slug[key] = self.client.find_tenant_by_slug(key)
-        return self._tenant_by_slug[key]
+        with self._cache_lock:
+            if key in self._tenant_by_slug:
+                return self._tenant_by_slug[key]
+        tenant = self.client.find_tenant_by_slug(key)
+        with self._cache_lock:
+            return self._tenant_by_slug.setdefault(key, tenant)
 
     def match(self, row: SheetRow) -> MatchResult:
         if row.status in ("invalid", "duplicate"):
@@ -1053,11 +1082,13 @@ class Matcher:
             doc = self.client.get_blog_by_id(self.collection, row.payload_id)
             if not doc:
                 return MatchResult(status="not_found", error=f"no document id={row.payload_id}")
+            tenant_ref = _tenant_ref(doc.get("tenant"))
             return MatchResult(
                 status="matched",
                 payload_id=str(doc.get("id")),
                 slug=doc.get("slug"),
-                tenant=_tenant_ref(doc.get("tenant")),
+                tenant=tenant_ref,
+                tenant_id=tenant_ref,
             )
 
         tenant_id: Optional[str] = None
@@ -1085,11 +1116,13 @@ class Matcher:
                     candidates=[str(d.get("id")) for d in docs],
                 )
             doc = docs[0]
+            tenant_ref = _tenant_ref(doc.get("tenant"))
             return MatchResult(
                 status="matched",
                 payload_id=str(doc.get("id")),
                 slug=doc.get("slug"),
-                tenant=_tenant_ref(doc.get("tenant")),
+                tenant=tenant_ref,
+                tenant_id=tenant_ref,
             )
 
         assert row.slug
@@ -1111,6 +1144,7 @@ class Matcher:
             payload_id=str(doc.get("id")),
             slug=doc.get("slug"),
             tenant=tenant_label or _tenant_ref(doc.get("tenant")),
+            tenant_id=tenant_id,
         )
 
 
@@ -1118,9 +1152,13 @@ class ProgressStore:
     def __init__(self, path: Path):
         self.path = path
         self.completed: dict[str, dict[str, Any]] = {}
+        self.deployed: dict[str, dict[str, Any]] = {}
+        self._pending_flush = 0
+        self._last_flush_at = time.monotonic()
         if path.exists():
             data = json.loads(path.read_text(encoding="utf-8"))
             self.completed = dict(data.get("completed") or {})
+            self.deployed = dict(data.get("deployed") or {})
 
     def is_done(self, identity_key: str, *, dry_run: bool = True) -> bool:
         """Skip rows already finished for this mode.
@@ -1146,12 +1184,35 @@ class ProgressStore:
         row_number: int,
         payload_id: Optional[str],
         error: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        tenant_label: Optional[str] = None,
+        flush_now: bool = False,
     ) -> None:
-        self.completed[identity_key] = {
+        existing = self.completed.get(identity_key)
+        if existing and existing.get("status") == status and not tenant_id:
+            return
+        entry: dict[str, Any] = {
             "status": status,
             "row_number": row_number,
             "payload_id": payload_id,
             "error": error,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        if tenant_id:
+            entry["tenant_id"] = str(tenant_id)
+        if tenant_label:
+            entry["tenant_label"] = tenant_label
+        self.completed[identity_key] = entry
+        self._pending_flush += 1
+        due = time.monotonic() - self._last_flush_at >= 3
+        if flush_now or status == "deleted" or self._pending_flush >= 200 or due:
+            self.flush()
+
+    def mark_deployed(self, tenant_id: str, *, ok: bool, label: str, message: str) -> None:
+        self.deployed[str(tenant_id)] = {
+            "ok": ok,
+            "label": label,
+            "message": message[:300],
             "at": datetime.now(timezone.utc).isoformat(),
         }
         self.flush()
@@ -1162,9 +1223,12 @@ class ProgressStore:
         payload = {
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "completed": self.completed,
+            "deployed": self.deployed,
         }
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
         tmp.replace(self.path)
+        self._pending_flush = 0
+        self._last_flush_at = time.monotonic()
 
 
 def append_result_jsonl(path: Path, record: Mapping[str, Any]) -> None:
@@ -1281,7 +1345,9 @@ def _row_record(row: SheetRow, status: str) -> dict[str, Any]:
     }
 
 
-def _log_row(results_path: Path, row: SheetRow, status: str) -> None:
+def _log_row(results_path: Path, row: SheetRow, status: str, *, quiet: bool = False) -> None:
+    if quiet:
+        return
     rec = _row_record(row, status)
     append_result_jsonl(results_path, rec)
     logger.info(
@@ -1310,6 +1376,8 @@ def print_preflight(report: Mapping[str, Any], cfg: RunConfig) -> None:
     print(f"Ambiguous:                {report['ambiguous']}")
     print(f"Ready for deletion:       {report['ready_for_deletion']}")
     print(f"Skipped (resume):         {report['skipped_already_done']}")
+    if not cfg.dry_run and cfg.auto_deploy:
+        print("After deletion:           publish each affected website")
     print("-" * 40)
 
 
@@ -1326,6 +1394,8 @@ def print_final_summary(counters: Counters) -> None:
     print(f"Failed:         {counters.failed}")
     print(f"Skipped:        {counters.skipped}")
     print(f"Remaining:      {counters.remaining}")
+    print(f"Sites published:{counters.deployed}")
+    print(f"Publish failed: {counters.deploy_failed}")
     print("-" * 40)
 
 
@@ -1343,6 +1413,144 @@ def _write_summary(path: Path, cfg: RunConfig, counters: Counters, report: Mappi
     logger.info("Wrote summary: %s", path)
 
 
+def collect_tenants_to_publish(
+    progress: ProgressStore,
+    deleted_rows: Sequence[SheetRow],
+    matcher: Matcher,
+) -> list[tuple[str, str]]:
+    """Tenant ids that had a successful delete and have not been published yet."""
+    already = {tid for tid, info in progress.deployed.items() if info.get("ok")}
+    pending: dict[str, str] = {}
+
+    def add(tenant_id: Optional[str], label: Optional[str]) -> None:
+        if not tenant_id:
+            return
+        tid = str(tenant_id)
+        if tid in already or tid in pending:
+            return
+        pending[tid] = label or tid
+
+    for row in deleted_rows:
+        add(row.matched_tenant_id, row.matched_tenant or row.domain)
+
+    domains_needed: set[str] = set()
+    for identity, entry in progress.completed.items():
+        if entry.get("status") != "deleted":
+            continue
+        if entry.get("tenant_id"):
+            add(str(entry["tenant_id"]), entry.get("tenant_label"))
+            continue
+        if identity.startswith("domain_slug:"):
+            domain = identity[len("domain_slug:") :].split("|", 1)[0]
+            if domain:
+                domains_needed.add(domain)
+
+    for domain in sorted(domains_needed):
+        tenant = matcher.resolve_tenant_domain(domain)
+        if tenant and tenant.get("id") is not None:
+            add(str(tenant["id"]), str(tenant.get("slug") or domain))
+    return list(pending.items())
+
+
+def publish_deleted_sites(
+    cfg: RunConfig,
+    client: PayloadRestClient,
+    progress: ProgressStore,
+    matcher: Matcher,
+    deleted_rows: Sequence[SheetRow],
+    counters: Counters,
+) -> None:
+    """Dispatch Publish content for each website that lost blogs. Never deploy-all."""
+    if cfg.dry_run or not cfg.auto_deploy:
+        return
+    targets = collect_tenants_to_publish(progress, deleted_rows, matcher)
+    if not targets:
+        logger.info("No websites need a content publish.")
+        return
+    logger.info("Publishing %s website(s) so deletions reach the live sites", len(targets))
+    for tenant_id, label in targets:
+        try:
+            result = client.publish_tenant(tenant_id)
+        except PayloadApiError as exc:
+            counters.deploy_failed += 1
+            progress.mark_deployed(tenant_id, ok=False, label=label, message=str(exc))
+            logger.error("Publish failed for %s (id=%s): %s", label, tenant_id, exc)
+            continue
+        ok = bool(result.get("ok"))
+        message = str(result.get("message") or "")
+        progress.mark_deployed(tenant_id, ok=ok, label=label, message=message)
+        if ok:
+            counters.deployed += 1
+            logger.info(
+                "Published %s (id=%s)%s",
+                label,
+                tenant_id,
+                f" run={result.get('runUrl')}" if result.get("runUrl") else "",
+            )
+        else:
+            counters.deploy_failed += 1
+            logger.error("Publish rejected for %s (id=%s): %s", label, tenant_id, message)
+
+
+def _apply_match(
+    row: SheetRow,
+    match: MatchResult,
+    counters: Counters,
+    ready: list[SheetRow],
+    progress: ProgressStore,
+    results_path: Path,
+) -> None:
+    if match.status == "matched":
+        row.matched_id = match.payload_id
+        row.matched_slug = match.slug
+        row.matched_tenant = match.tenant
+        row.matched_tenant_id = match.tenant_id
+        counters.matched += 1
+        ready.append(row)
+    elif match.status == "not_found":
+        row.status = "not_found"
+        row.error = match.error
+        counters.not_found += 1
+        _log_row(results_path, row, "not_found")
+        progress.mark(
+            row.identity_key,
+            status="not_found",
+            row_number=row.row_number,
+            payload_id=None,
+            error=match.error,
+        )
+    elif match.status == "ambiguous":
+        row.status = "ambiguous"
+        row.error = match.error
+        counters.ambiguous += 1
+        _log_row(results_path, row, "ambiguous")
+        progress.mark(
+            row.identity_key,
+            status="ambiguous",
+            row_number=row.row_number,
+            payload_id=None,
+            error=match.error,
+        )
+    else:
+        row.status = match.status
+        row.error = match.error
+        _log_row(results_path, row, row.status)
+
+
+def _preflight_report(counters: Counters, ready: Sequence[SheetRow]) -> dict[str, int]:
+    return {
+        "total_sheet_rows": counters.total_rows,
+        "valid_rows": counters.valid_rows,
+        "duplicate_rows": counters.duplicate_rows,
+        "invalid_rows": counters.invalid_rows,
+        "matched_payload_records": len(ready),
+        "not_found": counters.not_found,
+        "ambiguous": counters.ambiguous,
+        "ready_for_deletion": len(ready),
+        "skipped_already_done": counters.skipped,
+    }
+
+
 def run(cfg: RunConfig) -> Counters:
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1354,7 +1562,13 @@ def run(cfg: RunConfig) -> Counters:
     log_path = cfg.log_file or (cfg.output_dir / f"run-{stamp}.log")
 
     setup_logging(log_path)
-    logger.info("Starting bulk-delete (dry_run=%s, collection=%s)", cfg.dry_run, cfg.collection)
+    logger.info(
+        "Starting bulk-delete (dry_run=%s, collection=%s, workers=%s, delay_ms=%s)",
+        cfg.dry_run,
+        cfg.collection,
+        cfg.workers,
+        cfg.request_delay_ms,
+    )
     logger.info("Payload URL: %s", cfg.payload_url)
     logger.info("Output dir: %s", cfg.output_dir)
 
@@ -1386,13 +1600,15 @@ def run(cfg: RunConfig) -> Counters:
     progress = ProgressStore(progress_path)
 
     ready: list[SheetRow] = []
+    to_match: list[SheetRow] = []
     for row in rows:
         if row.status == "invalid":
             _log_row(results_path, row, "invalid")
             continue
         if row.status == "duplicate":
             counters.skipped += 1
-            _log_row(results_path, row, "duplicate")
+            if counters.skipped % 2000 == 0:
+                logger.info("Skipped %s already-finished or duplicate rows", counters.skipped)
             progress.mark(
                 row.identity_key,
                 status="duplicate",
@@ -1407,134 +1623,130 @@ def run(cfg: RunConfig) -> Counters:
             row.matched_id = prev.get("payload_id")
             row.error = f"already completed as {prev.get('status')}"
             counters.skipped += 1
-            _log_row(results_path, row, "skipped")
+            if counters.skipped % 2000 == 0:
+                logger.info("Skipped %s already-finished or duplicate rows", counters.skipped)
             continue
+        to_match.append(row)
 
+    def _match_one(row: SheetRow) -> tuple[Optional[MatchResult], Optional[PayloadApiError]]:
         try:
-            match = matcher.match(row)
+            return matcher.match(row), None
         except PayloadApiError as exc:
-            row.status = "failed"
-            row.error = str(exc)
-            counters.failed += 1
-            _log_row(results_path, row, "failed")
-            append_result_jsonl(failed_path, _row_record(row, "failed"))
-            continue
+            return None, exc
 
-        if match.status == "matched":
-            row.matched_id = match.payload_id
-            row.matched_slug = match.slug
-            row.matched_tenant = match.tenant
-            counters.matched += 1
-            ready.append(row)
-        elif match.status == "not_found":
-            row.status = "not_found"
-            row.error = match.error
-            counters.not_found += 1
-            _log_row(results_path, row, "not_found")
-            progress.mark(
-                row.identity_key,
-                status="not_found",
-                row_number=row.row_number,
-                payload_id=None,
-                error=match.error,
-            )
-        elif match.status == "ambiguous":
-            row.status = "ambiguous"
-            row.error = match.error
-            counters.ambiguous += 1
-            _log_row(results_path, row, "ambiguous")
-            progress.mark(
-                row.identity_key,
-                status="ambiguous",
-                row_number=row.row_number,
-                payload_id=None,
-                error=match.error,
-            )
-        else:
-            row.status = match.status
-            row.error = match.error
-            _log_row(results_path, row, row.status)
+    match_iter: Any = map(_match_one, to_match)
+    match_pool: Optional[ThreadPoolExecutor] = None
+    if cfg.workers > 1 and len(to_match) > 1:
+        match_pool = ThreadPoolExecutor(max_workers=cfg.workers)
+        match_iter = match_pool.map(_match_one, to_match)
+    try:
+        for row, (match, match_error) in zip(to_match, match_iter):
+            if match_error is not None:
+                row.status = "failed"
+                row.error = str(match_error)
+                counters.failed += 1
+                _log_row(results_path, row, "failed")
+                append_result_jsonl(failed_path, _row_record(row, "failed"))
+                continue
+            assert match is not None
+            _apply_match(row, match, counters, ready, progress, results_path)
+    finally:
+        if match_pool is not None:
+            match_pool.shutdown(wait=True)
 
-    report = {
-        "total_sheet_rows": counters.total_rows,
-        "valid_rows": counters.valid_rows,
-        "duplicate_rows": counters.duplicate_rows,
-        "invalid_rows": counters.invalid_rows,
-        "matched_payload_records": len(ready),
-        "not_found": counters.not_found,
-        "ambiguous": counters.ambiguous,
-        "ready_for_deletion": len(ready),
-        "skipped_already_done": counters.skipped,
-    }
+    report = _preflight_report(counters, ready)
     print_preflight(report, cfg)
 
     if not ready:
         logger.info("Nothing to delete.")
+        publish_deleted_sites(cfg, client, progress, matcher, [], counters)
         counters.remaining = 0
+        progress.flush()
         _write_summary(summary_path, cfg, counters, report)
+        print_final_summary(counters)
         return counters
 
     if not cfg.dry_run:
         require_confirmation(cfg, report)
 
     failed_rows: list[SheetRow] = []
-    for batch_start in range(0, len(ready), cfg.batch_size):
-        batch = ready[batch_start : batch_start + cfg.batch_size]
-        logger.info(
-            "Processing batch %s-%s / %s",
-            batch_start + 1,
-            batch_start + len(batch),
-            len(ready),
-        )
-        for row in batch:
+    deleted_rows: list[SheetRow] = []
+
+    def _record_delete(row: SheetRow, error: Optional[PayloadApiError]) -> None:
+        if error is None:
+            row.status = "deleted"
+            counters.deleted += 1
+            _log_row(results_path, row, "deleted")
+            deleted_rows.append(row)
+            progress.mark(
+                row.identity_key,
+                status="deleted",
+                row_number=row.row_number,
+                payload_id=row.matched_id,
+                tenant_id=row.matched_tenant_id,
+                tenant_label=row.matched_tenant or row.domain,
+            )
+            return
+        row.status = "failed"
+        row.error = str(error)
+        counters.failed += 1
+        failed_rows.append(row)
+        _log_row(results_path, row, "failed")
+        append_result_jsonl(failed_path, _row_record(row, "failed"))
+        if error.status == 404:
+            progress.mark(
+                row.identity_key,
+                status="not_found",
+                row_number=row.row_number,
+                payload_id=row.matched_id,
+                error="404 on delete",
+            )
+
+    if cfg.dry_run:
+        for row in ready:
+            row.status = "dry_run"
+            counters.dry_run += 1
+            _log_row(results_path, row, "dry_run")
+            progress.mark(
+                row.identity_key,
+                status="dry_run",
+                row_number=row.row_number,
+                payload_id=row.matched_id,
+            )
+    else:
+        def _delete_one(row: SheetRow) -> Optional[PayloadApiError]:
             assert row.matched_id
-            if cfg.dry_run:
-                row.status = "dry_run"
-                counters.dry_run += 1
-                _log_row(results_path, row, "dry_run")
-                progress.mark(
-                    row.identity_key,
-                    status="dry_run",
-                    row_number=row.row_number,
-                    payload_id=row.matched_id,
-                )
-                continue
             try:
                 client.delete_blog(cfg.collection, row.matched_id)
-                row.status = "deleted"
-                counters.deleted += 1
-                _log_row(results_path, row, "deleted")
-                progress.mark(
-                    row.identity_key,
-                    status="deleted",
-                    row_number=row.row_number,
-                    payload_id=row.matched_id,
-                )
+                return None
             except PayloadApiError as exc:
-                row.status = "failed"
-                row.error = str(exc)
-                counters.failed += 1
-                failed_rows.append(row)
-                _log_row(results_path, row, "failed")
-                append_result_jsonl(failed_path, _row_record(row, "failed"))
-                if exc.status == 404:
-                    progress.mark(
-                        row.identity_key,
-                        status="not_found",
-                        row_number=row.row_number,
-                        payload_id=row.matched_id,
-                        error="404 on delete",
-                    )
+                return exc
+
+        delete_iter: Any = map(_delete_one, ready)
+        delete_pool: Optional[ThreadPoolExecutor] = None
+        if cfg.workers > 1 and len(ready) > 1:
+            delete_pool = ThreadPoolExecutor(max_workers=cfg.workers)
+            delete_iter = delete_pool.map(_delete_one, ready)
+        logger.info("Deleting %s blogs with %s workers", len(ready), max(1, cfg.workers))
+        try:
+            for row, error in zip(ready, delete_iter):
+                _record_delete(row, error)
+        finally:
+            if delete_pool is not None:
+                delete_pool.shutdown(wait=True)
 
     if failed_rows:
         write_failed_retry_csv(retry_path, failed_rows)
         logger.info("Wrote retry file: %s (%s rows)", retry_path, len(failed_rows))
+
+    publish_deleted_sites(cfg, client, progress, matcher, deleted_rows, counters)
 
     counters.remaining = max(
         0,
         len(ready) - counters.deleted - counters.dry_run - len(failed_rows),
     )
     _write_summary(summary_path, cfg, counters, report)
+    progress.flush()
     print_final_summary(counters)
     return counters
 
@@ -1633,6 +1845,12 @@ def build_config_from_env_and_args(argv: Optional[Sequence[str]] = None) -> RunC
     p.add_argument("--blog-url-column", default=os.environ.get("BLOG_URL_COLUMN"))
     p.add_argument("--limit", type=int, default=None, help="Process only the first N data rows")
     p.add_argument("--batch-size", type=int, default=int(os.environ.get("BATCH_SIZE", "25")))
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=int(os.environ.get("BULK_DELETE_WORKERS", "1")),
+        help="Parallel Payload requests. 8 is a good speed-up. 1 is safest.",
+    )
     p.add_argument("--request-delay-ms", type=int, default=int(os.environ.get("REQUEST_DELAY_MS", "100")))
     p.add_argument(
         "--output-dir",
@@ -1647,6 +1865,13 @@ def build_config_from_env_and_args(argv: Optional[Sequence[str]] = None) -> RunC
         "--totp-code",
         default=None,
         help="6-digit authenticator code (or PAYLOAD_TOTP_CODE). Prompted interactively if needed.",
+    )
+    p.add_argument(
+        "--no-deploy",
+        dest="auto_deploy",
+        action="store_false",
+        default=True,
+        help="Delete in Payload only; do not publish affected websites",
     )
     p.add_argument(
         "--no-save-api-key",
@@ -1692,9 +1917,11 @@ def build_config_from_env_and_args(argv: Optional[Sequence[str]] = None) -> RunC
         dry_run=dry_run,
         limit=args.limit,
         batch_size=args.batch_size,
+        workers=max(1, args.workers),
         request_delay_ms=args.request_delay_ms,
         output_dir=args.output_dir,
         yes=args.yes,
+        auto_deploy=args.auto_deploy,
         progress_file=args.progress_file,
     )
 

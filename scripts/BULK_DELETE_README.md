@@ -24,7 +24,7 @@ The CMS runs `payload-totp` with `forceSetup: true`. Its access wrapper only let
 - an email/password session that has been **TOTP-verified** (`payload-totp` cookie).
 
 `read` is excluded from the wrapper, which is why lookups worked while
-`DELETE /api/blog-posts/:id` returned 403 with a plain JWT.
+`DELETE /api/blog-posts/:id`, then `POST /api/tenants/:id/publish` for each website that lost posts (same as admin **Publish content**). Skip live deploy with `--no-deploy`. returned 403 with a plain JWT.
 
 The script handles this automatically:
 
